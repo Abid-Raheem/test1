@@ -1,0 +1,219 @@
+name: Windows RDP Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: 'Duration in hours (max 6)'
+        required: false
+        default: '6'
+        type: string
+
+jobs:
+  setup-windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360  # 6 hours maximum
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable RDP and create user
+        shell: powershell
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Create RDP user
+          $username = "rdpuser"
+          $password = ConvertTo-SecureString "RDP@$(Get-Random -Minimum 1000 -Maximum 9999)" -AsPlainText -Force
+          New-LocalUser -Name $username -Password $password -PasswordNeverExpires:$true -UserMayNotChangePassword:$true
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          
+          # Store credentials for ngrok step
+          $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($password))
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$plainPassword" >> $env:GITHUB_ENV
+          
+          Write-Host "RDP User Created: $username"
+          Write-Host "RDP Password: $plainPassword"
+
+      - name: Setup cloudflared
+        shell: powershell
+        run: |
+          Write-Host "Installing cloudflared..."
+          # Download and install cloudflared
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+          Write-Host "Cloudflared installed successfully."
+
+      - name: Start cloudflared tunnel
+        shell: powershell
+        run: |
+          Write-Host "Starting cloudflared tunnel for RDP..."
+          
+          # Start cloudflared tunnel
+          $cloudflaredProcess = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel", "--url", "tcp://localhost:3389" -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_output.txt" -RedirectStandardError "cloudflared_error.txt"
+          
+          Write-Host "Cloudflared process started with ID: $($cloudflaredProcess.Id)"
+          
+          # Wait for cloudflared to start and get the URL
+          Write-Host "Waiting for cloudflared to establish tunnel..."
+          Start-Sleep -Seconds 20
+          
+          # Try to get the tunnel URL from cloudflared output
+          $tunnelUrl = ""
+          $attempts = 0
+          $maxAttempts = 40
+          
+          while ($attempts -lt $maxAttempts -and [string]::IsNullOrEmpty($tunnelUrl)) {
+            Start-Sleep -Seconds 2
+            $attempts++
+            Write-Host "Attempt $attempts/$maxAttempts - Looking for tunnel URL..."
+            
+            # Check both output files for the tunnel URL
+            $filesToCheck = @("cloudflared_output.txt", "cloudflared_error.txt")
+            foreach ($file in $filesToCheck) {
+              if (Test-Path $file) {
+                $output = Get-Content $file -Raw -ErrorAction SilentlyContinue
+                if ($output -match "https://([^.\s]+\.trycloudflare\.com)") {
+                  $tunnelUrl = $matches[1]
+                  Write-Host "Found tunnel URL: $tunnelUrl"
+                  break
+                }
+                # Also check for the full URL format
+                if ($output -match "(https://[^.\s]+\.trycloudflare\.com)") {
+                  $fullUrl = $matches[1]
+                  $tunnelUrl = $fullUrl -replace "https://", ""
+                  Write-Host "Found tunnel URL from full format: $tunnelUrl"
+                  break
+                }
+              }
+            }
+            
+            if (-not [string]::IsNullOrEmpty($tunnelUrl)) {
+              break
+            }
+          }
+          
+          if (-not [string]::IsNullOrEmpty($tunnelUrl)) {
+            Write-Host "=== RDP Connection Info ==="
+            Write-Host "Address: $tunnelUrl"
+            Write-Host "Username: $env:RDP_USERNAME"
+            Write-Host "Password: $env:RDP_PASSWORD"
+            Write-Host "=========================="
+            Write-Host ""
+            Write-Host "Connect using your RDP client with the address above"
+            
+            # Store for later use
+            echo "TUNNEL_ADDRESS=$tunnelUrl" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "WARNING: Could not automatically detect cloudflared tunnel URL."
+            Write-Host "Please check the logs below for the tunnel URL:"
+            Write-Host ""
+            
+            if (Test-Path "cloudflared_output.txt") {
+              Write-Host "=== Cloudflared Output ==="
+              Get-Content "cloudflared_output.txt"
+              Write-Host ""
+            }
+            if (Test-Path "cloudflared_error.txt") {
+              Write-Host "=== Cloudflared Error/Info Log ==="
+              Get-Content "cloudflared_error.txt"
+              Write-Host ""
+            }
+            
+            Write-Host "Look for a URL ending in '.trycloudflare.com' in the logs above."
+            
+            # Store placeholder info
+            echo "TUNNEL_ADDRESS=Check_logs_above_for_trycloudflare_com_URL" >> $env:GITHUB_ENV
+          }
+
+      - name: Keep session alive
+        shell: powershell
+        run: |
+          $durationHours = [int]"${{ github.event.inputs.duration_hours || '6' }}"
+          $endTime = (Get-Date).AddHours($durationHours)
+          
+          Write-Host "Keeping RDP session alive for $durationHours hours until $endTime"
+          Write-Host "GitHub Actions will timeout after 6 hours maximum."
+          Write-Host "Using cloudflared tunnel"
+          
+          $displayInterval = 0
+          while ((Get-Date) -lt $endTime) {
+            Write-Host "Session active - $(Get-Date) (ends at $endTime)"
+            
+            # Check if cloudflared is still running
+            $cloudflaredProcesses = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+            if (-not $cloudflaredProcesses) {
+              Write-Host "cloudflared process not found, restarting..."
+              Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel", "--url", "tcp://localhost:3389" -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_output.txt" -RedirectStandardError "cloudflared_error.txt"
+              Start-Sleep -Seconds 20
+              
+              # Try to get the new tunnel URL
+              $newTunnelUrl = ""
+              $attempts = 0
+              while ($attempts -lt 20 -and [string]::IsNullOrEmpty($newTunnelUrl)) {
+                Start-Sleep -Seconds 2
+                $attempts++
+                
+                $filesToCheck = @("cloudflared_output.txt", "cloudflared_error.txt")
+                foreach ($file in $filesToCheck) {
+                  if (Test-Path $file) {
+                    $output = Get-Content $file -Raw -ErrorAction SilentlyContinue
+                    if ($output -match "https://([^.\s]+\.trycloudflare\.com)") {
+                      $newTunnelUrl = $matches[1]
+                      break
+                    }
+                  }
+                }
+                
+                if (-not [string]::IsNullOrEmpty($newTunnelUrl)) {
+                  echo "TUNNEL_ADDRESS=$newTunnelUrl" >> $env:GITHUB_ENV
+                  Write-Host "New tunnel URL after restart: $newTunnelUrl"
+                  break
+                }
+              }
+            }
+            
+            # Display tunnel info every 30 minutes
+            $displayInterval++
+            if ($displayInterval % 30 -eq 0) {
+              Write-Host "=== Current RDP Connection Info ==="
+              Write-Host "Address: $env:TUNNEL_ADDRESS"
+              Write-Host "Username: $env:RDP_USERNAME"
+              Write-Host "Password: $env:RDP_PASSWORD"
+              Write-Host "Time remaining: $([math]::Round(($endTime - (Get-Date)).TotalHours, 2)) hours"
+              Write-Host "=================================="
+            }
+            
+            Start-Sleep -Seconds 60  # Check every minute
+          }
+          
+          Write-Host "Session duration completed."
+
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "Cleaning up..."
+          
+          # Stop cloudflared process
+          Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "Cloudflared process stopped."
+          
+          # Remove RDP user
+          try {
+            Remove-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+            Write-Host "RDP user removed."
+          } catch {
+            Write-Host "Could not remove RDP user or user doesn't exist."
+          }
+          
+          # Clean up temporary files
+          Remove-Item -Path "cloudflared_output.txt" -ErrorAction SilentlyContinue
+          Remove-Item -Path "cloudflared_error.txt" -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\cloudflared.exe" -ErrorAction SilentlyContinue
+          
+          Write-Host "Cleanup completed."
