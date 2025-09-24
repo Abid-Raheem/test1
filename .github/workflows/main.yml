@@ -189,7 +189,8 @@ jobs:
             Write-Host "Look for a URL ending in '.trycloudflare.com' in the logs above."
             
             # Store placeholder info
-            echo "TUNNEL_ADDRESS=Check_logs_above_for_trycloudflare_com_URL" >> $env:GITHUB_ENV
+            $placeholderAddress = "Check_logs_above_for_trycloudflare_com_URL"
+            echo "TUNNEL_ADDRESS=$placeholderAddress" >> $env:GITHUB_ENV
           }
 
       - name: Keep session alive
@@ -210,7 +211,8 @@ jobs:
             $cloudflaredProcesses = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
             if (-not $cloudflaredProcesses) {
               Write-Host "cloudflared process not found, restarting..."
-              Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel", "--url", "tcp://localhost:3389" -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_output.txt" -RedirectStandardError "cloudflared_error.txt"
+              $restartArgs = @("tunnel", "--url", "tcp://127.0.0.1:3389", "--no-autoupdate")
+              Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $restartArgs -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_output.txt" -RedirectStandardError "cloudflared_error.txt"
               Start-Sleep -Seconds 20
               
               # Try to get the new tunnel URL
