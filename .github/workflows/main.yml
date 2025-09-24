@@ -21,9 +21,22 @@ jobs:
       - name: Enable RDP and create user
         shell: powershell
         run: |
+          Write-Host "Configuring RDP service..."
+          
           # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          
+          # Enable RDP through Windows Firewall
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Start Terminal Services
+          Set-Service -Name "TermService" -StartupType Automatic
+          Start-Service -Name "TermService"
+          
+          # Ensure RDP is listening on port 3389
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "PortNumber" -value 3389
+          
+          Write-Host "RDP service configured and started."
           
           # Create RDP user
           $username = "rdpuser"
@@ -32,13 +45,29 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           Add-LocalGroupMember -Group "Administrators" -Member $username
           
-          # Store credentials for ngrok step
+          # Store credentials
           $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($password))
           echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$plainPassword" >> $env:GITHUB_ENV
           
           Write-Host "RDP User Created: $username"
           Write-Host "RDP Password: $plainPassword"
+          
+          # Verify RDP is listening
+          Write-Host "Checking if RDP is listening on port 3389..."
+          $rdpListener = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+          if ($rdpListener) {
+            Write-Host "✅ RDP is listening on port 3389"
+          } else {
+            Write-Host "⚠️ RDP may not be listening yet, waiting..."
+            Start-Sleep -Seconds 5
+            $rdpListener = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+            if ($rdpListener) {
+              Write-Host "✅ RDP is now listening on port 3389"
+            } else {
+              Write-Host "❌ Warning: RDP may not be properly configured"
+            }
+          }
 
       - name: Setup cloudflared
         shell: powershell
@@ -53,14 +82,39 @@ jobs:
         run: |
           Write-Host "Starting cloudflared tunnel for RDP..."
           
-          # Start cloudflared tunnel
-          $cloudflaredProcess = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel", "--url", "tcp://localhost:3389" -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_output.txt" -RedirectStandardError "cloudflared_error.txt"
+          # Double-check RDP is ready
+          Write-Host "Final check - ensuring RDP is ready..."
+          $rdpReady = $false
+          for ($i = 1; $i -le 10; $i++) {
+            $rdpListener = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+            if ($rdpListener) {
+              Write-Host "✅ RDP confirmed ready on attempt $i"
+              $rdpReady = $true
+              break
+            }
+            Write-Host "Waiting for RDP... attempt $i/10"
+            Start-Sleep -Seconds 2
+          }
+          
+          if (-not $rdpReady) {
+            Write-Host "❌ Warning: RDP may not be fully ready, but proceeding with tunnel creation"
+          }
+          
+          # Start cloudflared tunnel with better arguments for RDP
+          Write-Host "Creating cloudflared tunnel..."
+          $cloudflaredArgs = @(
+            "tunnel",
+            "--url", "tcp://127.0.0.1:3389",
+            "--no-autoupdate"
+          )
+          
+          $cloudflaredProcess = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cloudflaredArgs -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_output.txt" -RedirectStandardError "cloudflared_error.txt"
           
           Write-Host "Cloudflared process started with ID: $($cloudflaredProcess.Id)"
           
           # Wait for cloudflared to start and get the URL
           Write-Host "Waiting for cloudflared to establish tunnel..."
-          Start-Sleep -Seconds 20
+          Start-Sleep -Seconds 25
           
           # Try to get the tunnel URL from cloudflared output
           $tunnelUrl = ""
@@ -98,13 +152,21 @@ jobs:
           }
           
           if (-not [string]::IsNullOrEmpty($tunnelUrl)) {
-            Write-Host "=== RDP Connection Info ==="
-            Write-Host "Address: $tunnelUrl"
+            Write-Host "========================================="
+            Write-Host "🎉 RDP CONNECTION READY!"
+            Write-Host "========================================="
+            Write-Host "Address: $tunnelUrl:3389"
             Write-Host "Username: $env:RDP_USERNAME"
             Write-Host "Password: $env:RDP_PASSWORD"
-            Write-Host "=========================="
+            Write-Host "========================================="
             Write-Host ""
-            Write-Host "Connect using your RDP client with the address above"
+            Write-Host "📋 CONNECTION INSTRUCTIONS:"
+            Write-Host "• Windows RDP Client: Use '$tunnelUrl:3389'"
+            Write-Host "• Mac Remote Desktop: Add PC with '$tunnelUrl:3389'"
+            Write-Host "• Linux: rdesktop -u $env:RDP_USERNAME -p $env:RDP_PASSWORD $tunnelUrl:3389"
+            Write-Host ""
+            Write-Host "⚠️  IMPORTANT: Always include ':3389' port number!"
+            Write-Host "========================================="
             
             # Store for later use
             echo "TUNNEL_ADDRESS=$tunnelUrl" >> $env:GITHUB_ENV
@@ -180,12 +242,14 @@ jobs:
             # Display tunnel info every 30 minutes
             $displayInterval++
             if ($displayInterval % 30 -eq 0) {
-              Write-Host "=== Current RDP Connection Info ==="
-              Write-Host "Address: $env:TUNNEL_ADDRESS"
+              Write-Host "========================================="
+              Write-Host "📡 CURRENT RDP CONNECTION INFO"
+              Write-Host "========================================="
+              Write-Host "Address: $env:TUNNEL_ADDRESS`:3389"
               Write-Host "Username: $env:RDP_USERNAME"
               Write-Host "Password: $env:RDP_PASSWORD"
               Write-Host "Time remaining: $([math]::Round(($endTime - (Get-Date)).TotalHours, 2)) hours"
-              Write-Host "=================================="
+              Write-Host "========================================="
             }
             
             Start-Sleep -Seconds 60  # Check every minute
